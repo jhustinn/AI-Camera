@@ -1,0 +1,68 @@
+timezone: Asia/Jakarta
+
+camera:
+  id: demo-cam
+  name: Video Demo
+  source: data/demo/demo.mp4
+  width: 1280
+  height: 720
+  fps: 5
+
+detection:
+  model: yolov8n.pt
+  confidence: 0.4
+  iou: 0.5
+  device: "0"
+  tracker: bytetrack
+  imgsz: 640
+  max_width: 0
+  torch_threads: 4
+  track_buffer: 30
+  classes: [0]
+
+face:
+  enabled: true
+  model: buffalo_l
+  providers: [CPUExecutionProvider]
+  det_size: [320, 320]
+  similarity_threshold: 0.4
+  run_every_n_frames: 5
+  region_ratio: 0.55
+  region_top_offset: 0.12
+  widen: 0.12
+  crop_max_width: 640
+  upscale: 2
+  score_threshold: 0.6
+  min_face_px: 16
+  votes_required: 3
+
+presence:
+  enter_confirm_sec: 1
+  leave_confirm_sec: 1
+  away_grace_sec: 3
+  min_session_sec: 3
+  desk_overlap_ratio: 0.5
+
+desks:
+  - id: 1
+    label: Kursi 1
+    employee_id: null
+    roi: [0.05, 0.15, 0.45, 0.95]
+  - id: 2
+    label: Kursi 2
+    employee_id: null
+    roi: [0.55, 0.15, 0.95, 0.95]
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  poll_seconds: 2
+  stream_host: "127.0.0.1"
+  stream_port: 8001
+  stream_fps: 12
+  jpeg_quality: 80
+
+logging:
+  level: INFO
+  csv_fallback: true
+  screenshot_dir: data/screenshots

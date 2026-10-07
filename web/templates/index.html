@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Monitoring Kehadiran Karyawan</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --panel-2: #273449;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --ok: #22c55e;
+    --away: #ef4444;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", Roboto, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 18px 24px; background: var(--panel); border-bottom: 1px solid #334155; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 18px; margin: 0; }
+  .badge { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
+  .badge.live { background: rgba(34,197,94,.15); color: var(--ok); }
+  .badge.off { background: rgba(239,68,68,.15); color: var(--away); }
+  main { padding: 20px 24px 48px; display: grid; gap: 20px; }
+  section { background: var(--panel); border: 1px solid #334155; border-radius: 12px; padding: 16px 18px; }
+  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+  .card { background: var(--panel-2); border-radius: 10px; padding: 14px; border-left: 4px solid var(--muted); }
+  .card.present { border-left-color: var(--ok); }
+  .card.away { border-left-color: var(--away); }
+  .card h3 { margin: 0 0 6px; font-size: 15px; }
+  .card .who { font-size: 13px; color: var(--text); }
+  .card .timer { font-size: 22px; font-variant-numeric: tabular-nums; margin-top: 8px; }
+  .card .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  tbody tr:hover { background: var(--panel-2); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  input, select, button { background: var(--panel-2); color: var(--text); border: 1px solid #475569; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  a.btn { text-decoration: none; display: inline-block; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel); border: 1px solid #475569; }
+  .scroll { max-height: 340px; overflow: auto; }
+  footer { padding: 16px 24px 30px; color: var(--muted); font-size: 12px; }
+  canvas { max-height: 260px; }
+  .progress { height: 10px; background: var(--panel); border-radius: 999px; overflow: hidden; border: 1px solid #334155; }
+  #enBar { height: 100%; width: 0; background: linear-gradient(90deg, #38bdf8, #22c55e); transition: width .2s; }
+  #enResult { margin-top: 10px; font-size: 13px; }
+  .ok { color: var(--ok); }
+  .err { color: var(--away); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Monitoring Kehadiran Karyawan &mdash; {{ timezone }}</h1>
+  <div>
+    <span id="recorderBadge" class="badge">recorder:connecting</span>
+    <span class="badge" id="clock"></span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>Status Real-time per Kursi</h2>
+    <div class="cards" id="deskCards"><span class="muted">memuat data...</span></div>
+  </section>
+
+  <section>
+    <h2>Sesi Kehadiran</h2>
+    <div class="toolbar">
+      <label class="muted" for="dayPicker">Tanggal</label>
+      <input type="date" id="dayPicker" />
+      <select id="deskFilter"><option value="">Semua kursi</option></select>
+      <button id="btnRefresh">Muat ulang</button>
+      <a class="btn btn" id="btnExport" href="#">Export CSV</a>
+      <span class="muted" id="sessionCount"></span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Karyawan</th><th>Kursi</th><th>Masuk</th><th>Keluar</th>
+            <th>Durasi</th><th>Total Keluar</th><th>Jumlah Keluar</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="sessionRows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid-2">
+    <section>
+      <h2>Rekap Harian (7 hari)</h2>
+      <canvas id="dailyChart"></canvas>
+    </section>
+    <section>
+      <h2>Durasi per Karyawan (hari dipilih)</h2>
+      <canvas id="employeeChart"></canvas>
+    </section>
+  </div>
+
+  <div class="grid-2">
+    <section>
+      <h2>Daftarkan Wajah (Enrollment)</h2>
+      <div class="grid-2" style="gap:16px">
+        <div>
+          <div class="toolbar">
+            <input id="enName" placeholder="Nama karyawan" style="min-width:170px" />
+            <input id="enNo" placeholder="No. karyawan (opsional)" style="min-width:150px" />
+            <input id="enDept" placeholder="Departemen (opsional)" style="min-width:150px" />
+            <input id="enCount" type="number" min="3" max="30" value="10" style="width:70px" title="jumlah sampel" />
+          </div>
+          <div class="toolbar">
+            <button id="enStart">Mulai Enrollment</button>
+            <button id="enSave">Simpan</button>
+            <button id="enCancel">Batal</button>
+            <span class="muted" id="enState">idle</span>
+          </div>
+          <div class="progress"><div id="enBar"></div></div>
+          <p class="muted" id="enHint">Pastikan wajah terlihat jelas di kamera. Sampel diambil otomatis setiap ~1 detik saat wajah terdeteksi.</p>
+          <div id="enResult"></div>
+        </div>
+        <div>
+          <img id="enFrame" alt="pratinjau enrollment" style="max-width:100%;border-radius:10px;border:1px solid #334155" />
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Daftar Karyawan</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Nama</th><th>Dept</th><th>Sampel</th><th>Wajah</th><th>Aksi</th></tr></thead>
+        <tbody id="employeeRows"></tbody>
+      </table>
+      <p class="muted">Wajah tersimpan sebagai vektor 128 dimensi, bukan file foto.</p>
+    </section>
+  </div>
+
+  <div class="grid-2">
+    <section>
+      <h2>Pemetaan Karyawan ke Kursi</h2>
+      <table>
+        <thead><tr><th>Kursi</th><th>Karyawan tetap</th><th>Aksi</th></tr></thead>
+        <tbody id="deskAssignRows"></tbody>
+      </table>
+      <p class="muted">Kursi tanpa nama tetap terekam sebagai "Tidak dikenal"; pemetaan hanya untuk tampilan.</p>
+    </section>
+    <section>
+      <h2>Aktivitas Terbaru</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Waktu</th><th>Jenis</th><th>Kursi</th><th>Karyawan</th></tr></thead>
+          <tbody id="eventRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Pratinjau Kamera <span class="muted" id="streamMeta">(live {{ stream_fps }} fps)</span></h2>
+    <div>
+      <img id="cameraFrame" alt="pratinjau live kamera" style="max-width:100%;border-radius:10px;border:1px solid #334155" />
+    </div>
+    <p class="muted" id="streamHint">Menghubungkan ke recorder (MJPEG) di port {{ stream_port }}...</p>
+  </section>
+</main>
+
+<footer>
+  Sistem ini merekam aktivitas di area kerja. Pastikan seluruh karyawan telah diberikan pemberitahuan dan persetujuan
+  sebelum kamera dijalankan, dan batasi akses ke data ini sesuai kebijakan data pribadi perusahaan.
+</footer>
+
+<script>
+const STREAM_URL = "{{ stream_url }}";
+const STREAM_PROXY = '/stream';
+const POLL_MS = {{ poll_seconds }} * 1000;
+const els = {
+  cards: document.getElementById('deskCards'),
+  badge: document.getElementById('recorderBadge'),
+  clock: document.getElementById('clock'),
+  day: document.getElementById('dayPicker'),
+  deskFilter: document.getElementById('deskFilter'),
+  sessionRows: document.getElementById('sessionRows'),
+  sessionCount: document.getElementById('sessionCount'),
+  employeeRows: document.getElementById('employeeRows'),
+  deskAssignRows: document.getElementById('deskAssignRows'),
+  eventRows: document.getElementById('eventRows'),
+  frame: document.getElementById('cameraFrame'),
+  streamHint: document.getElementById('streamHint'),
+  streamMeta: document.getElementById('streamMeta'),
+  exportLink: document.getElementById('btnExport'),
+};
+
+function attachStream(img, onFail) {
+  let target = STREAM_URL;
+  img.onload = () => { img.dataset.ok = '1'; };
+  img.onerror = () => {
+    img.dataset.ok = '0';
+    if (onFail) onFail();
+    if (target === STREAM_URL && location.protocol === 'http:' && location.port !== '{{ stream_port }}') {
+      target = STREAM_PROXY;
+      img.src = target + '?t=' + Date.now();
+      return;
+    }
+    setTimeout(() => { img.src = target + '?t=' + Date.now(); }, 4000);
+  };
+  img.src = target + '?t=' + Date.now();
+}
+
+function startStream() {
+  els.streamHint.textContent = 'Menghubungkan ke recorder (MJPEG)...';
+  attachStream(en.frame, () => {
+    en.hint.textContent = 'Pratinjau kamera tidak tersambung - pastikan recorder berjalan.';
+  });
+  attachStream(els.frame);
+  els.frame.onload = () => {
+    els.streamHint.textContent = 'Live streaming dari recorder. Teh Ctrl+F5 untuk muat ulang bila macet.';
+    els.streamMeta.textContent = 'live MJPEG';
+  };
+  els.streamMeta.textContent = 'live MJPEG';
+}
+
+const today = new Date();
+const isoToday = new Date(today.getTime() - today.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+els.day.value = isoToday;
+
+let deskMap = {};
+let employeeMap = {};
+let dailyChart = null;
+let employeeChart = null;
+
+const fmtSec = (s) => {
+  s = Math.max(0, Math.floor(Number(s || 0)));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const d = s % 60;
+  return h > 0 ? `${h}j ${m}m` : (m > 0 ? `${m}m ${d}d` : `${d}d`);
+};
+const fmtClock = (v) => v ? new Date(v).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) : '-';
+const fmtDateTime = (v) => v ? new Date(v).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' }) : '-';
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+function renderCards(desks) {
+  if (!desks.length) { els.cards.innerHTML = '<span class="muted">belum ada data live (recorder belum jalan)</span>'; return; }
+  els.cards.innerHTML = desks.map((d) => {
+    const present = d.status === 'PRESENT';
+    const name = d.employee_name || 'Tidak dikenal';
+    const timer = present ? fmtSec(d.duration_sec) : (d.away_sec ? fmtSec(d.away_sec) + ' away' : '-');
+    const since = present ? `sejak ${fmtClock(d.sit_since)}` : 'tidak ada di kursi';
+    return `<div class="card ${present ? 'present' : 'away'}">
+      <h3>${d.label}</h3>
+      <div class="who">${name}</div>
+      <div class="timer">${timer}</div>
+      <div class="meta">${since}</div>
+      <div class="meta">fps ${(d.fps ?? 0).toFixed(1)}${d.assigned_employee_id && d.employee_id !== d.assigned_employee_id ? ' · beda dari kursi tetap' : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderSessions(rows) {
+  els.sessionRows.innerHTML = rows.length ? rows.map((r) => `<tr>
+      <td>${r.employee_name || 'Tidak dikenal'}</td>
+      <td>${r.desk_label}</td>
+      <td>${fmtClock(r.sit_start_local)}</td>
+      <td>${fmtClock(r.sit_end_local)}</td>
+      <td>${fmtSec(r.duration_sec)}</td>
+      <td>${fmtSec(r.away_sec)}</td>
+      <td>${r.away_count}</td>
+      <td><span class="pill">${r.status}</span></td>
+    </tr>`).join('') : '<tr><td colspan="8" class="muted">belum ada sesi</td></tr>';
+  els.sessionCount.textContent = `${rows.length} baris`;
+}
+
+function renderAssignments(desks, employees) {
+  const options = (selected) => `<option value="">- tidak ada -</option>` +
+    employees.map((e) => `<option value="${e.id}" ${e.id === selected ? 'selected' : ''}>${e.name}${e.dept ? ' (' + e.dept + ')' : ''}${e.has_embedding ? '' : ' [wajah belum daftar]'}</option>`).join('');
+  els.deskAssignRows.innerHTML = desks.map((d) => `<tr>
+      <td>${d.label}</td>
+      <td><select data-desk="${d.id}">${options(d.employee_id)}</select></td>
+      <td><button data-save="${d.id}">Simpan</button></td>
+    </tr>`).join('');
+  els.deskAssignRows.querySelectorAll('[data-save]').forEach((btn) => {
+    btn.onclick = async () => {
+      const deskId = btn.dataset.save;
+      const select = els.deskAssignRows.querySelector(`select[data-desk="${deskId}"]`);
+      await api('/api/assign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desk_id: Number(deskId), employee_id: select.value ? Number(select.value) : null }),
+      });
+      loadAssignments();
+    };
+  });
+}
+
+function renderEvents(rows) {
+  els.eventRows.innerHTML = rows.length ? rows.map((e) => `<tr>
+      <td>${fmtDateTime(e.ts)}</td>
+      <td><span class="pill">${e.event_type}</span></td>
+      <td>${e.desk_label || '-'}</td>
+      <td>${e.employee_name || '-'}</td>
+    </tr>`).join('') : '<tr><td colspan="4" class="muted">belum ada aktivitas</td></tr>';
+}
+
+function renderDaily(rows) {
+  const labels = rows.map((r) => r.work_date);
+  const sit = rows.map((r) => Number(r.total_sit_sec) / 3600);
+  const away = rows.map((r) => Number(r.total_away_sec) / 3600);
+  const data = { labels, datasets: [
+    { label: 'Duduk (jam)', data: sit, backgroundColor: '#22c55e' },
+    { label: 'Keluar (jam)', data: away, backgroundColor: '#ef4444' },
+  ]};
+  if (dailyChart) { dailyChart.data = data; dailyChart.update(); return; }
+  dailyChart = new Chart(document.getElementById('dailyChart'), { type: 'bar', data,
+    options: { responsive: true, plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } } });
+}
+
+function renderEmployees(rows) {
+  const labels = rows.map((r) => r.employee_name);
+  const sit = rows.map((r) => Number(r.total_sit_sec) / 3600);
+  const away = rows.map((r) => Number(r.total_away_sec) / 3600);
+  const data = { labels, datasets: [
+    { label: 'Duduk (jam)', data: sit, backgroundColor: '#38bdf8' },
+    { label: 'Keluar (jam)', data: away, backgroundColor: '#f59e0b' },
+  ]};
+  if (employeeChart) { employeeChart.data = data; employeeChart.update(); return; }
+  employeeChart = new Chart(document.getElementById('employeeChart'), { type: 'bar', data,
+    options: { indexAxis: 'y', responsive: true, plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } } });
+}
+
+async function loadLive() {
+  try {
+    const status = await api('/api/status');
+    deskMap = Object.fromEntries((status.desks || []).map((d) => [d.desk_id, d]));
+    els.badge.textContent = status.recorder_running ? 'recorder:jalan' : 'recorder:berhenti';
+    els.badge.className = 'badge ' + (status.recorder_running ? 'live' : 'off');
+    renderCards(status.desks || []);
+  } catch (err) {
+    els.badge.textContent = 'dashboard error';
+    els.badge.className = 'badge off';
+  }
+}
+
+async function loadSessions() {
+  const params = new URLSearchParams();
+  if (els.day.value) params.set('day', els.day.value);
+  if (els.deskFilter.value) params.set('desk_id', els.deskFilter.value);
+  const query = params.toString();
+  els.exportLink.href = '/api/export.csv' + (query ? '?' + query : '');
+  const data = await api('/api/sessions?' + query);
+  renderSessions(data.sessions);
+}
+
+async function loadSummaries() {
+  const dayParams = els.day.value ? '?day=' + els.day.value : '';
+  renderDaily((await api('/api/summary/daily?days=7')).daily);
+  renderEmployees((await api('/api/summary/employees' + dayParams)).employees);
+}
+
+async function loadEvents() {
+  renderEvents((await api('/api/events?limit=30')).events);
+}
+
+async function loadAssignments() {
+  const [desks, employees] = await Promise.all([api('/api/desks'), api('/api/employees')]);
+  employeeMap = Object.fromEntries(employees.employees.map((e) => [e.id, e]));
+  renderEmployeeTable(employees.employees);
+  const select = els.deskFilter;
+  const current = select.value;
+  select.innerHTML = '<option value="">Semua kursi</option>' +
+    desks.desks.map((d) => `<option value="${d.id}">${d.label}</option>`).join('');
+  select.value = current;
+  renderAssignments(desks.desks, employees.employees);
+}
+
+els.day.addEventListener('change', () => { loadSessions(); loadSummaries(); });
+els.deskFilter.addEventListener('change', loadSessions);
+
+const en = {
+  name: document.getElementById('enName'),
+  no: document.getElementById('enNo'),
+  dept: document.getElementById('enDept'),
+  count: document.getElementById('enCount'),
+  start: document.getElementById('enStart'),
+  save: document.getElementById('enSave'),
+  cancel: document.getElementById('enCancel'),
+  state: document.getElementById('enState'),
+  bar: document.getElementById('enBar'),
+  hint: document.getElementById('enHint'),
+  result: document.getElementById('enResult'),
+  frame: document.getElementById('enFrame'),
+};
+
+async function enrollCall(path, options) {
+  const res = await fetch(path, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data.detail;
+    let message;
+    if (typeof detail === 'string') message = detail;
+    else if (Array.isArray(detail) && detail.length) message = detail.map((d) => `${(d.loc || []).slice(-1)}: ${d.msg}`).join('; ');
+    else message = res.statusText;
+    throw new Error(message);
+  }
+  return data;
+}
+
+function renderEnroll(status) {
+  if (!status || status.status === 'idle') {
+    en.state.textContent = 'idle';
+    en.state.className = 'muted';
+    en.bar.style.width = '0%';
+    en.hint.textContent = 'Pastikan wajah terlihat jelas di kamera. Sampel diambil otomatis setiap ~1 detik saat wajah terdeteksi.';
+    if (status && status.last_result) {
+      const r = status.last_result;
+      en.result.innerHTML = `<span class="ok">Tersimpan: ${r.name} (id ${r.employee_id}, ${r.samples} sampel)</span>`;
+    }
+    return;
+  }
+  en.state.textContent = `${status.status} · ${status.samples}/${status.target} sampel`;
+  en.state.className = status.status === 'running' ? '' : 'err';
+  const pct = Math.min(100, Math.round((status.samples / status.target) * 100));
+  en.bar.style.width = pct + '%';
+  en.hint.textContent = status.ready
+    ? 'Cukup sampel — klik Simpan untuk menyimpan ke database.'
+    : (status.last_error ? 'Menunggu: ' + status.last_error : 'Mengambil sampel...');
+  en.result.innerHTML = '';
+}
+
+async function pollEnroll() {
+  try {
+    renderEnroll(await enrollCall('/api/enroll/status'));
+  } catch (err) {
+    en.state.textContent = 'recorder offline';
+    en.state.className = 'err';
+  }
+}
+
+en.start.onclick = async () => {
+  if (!en.name.value.trim()) { alert('Isi nama karyawan dulu'); return; }
+  try {
+    renderEnroll(await enrollCall('/api/enroll/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: en.name.value.trim(),
+        employee_no: en.no.value.trim() || null,
+        dept: en.dept.value.trim() || null,
+        count: Number(en.count.value) || 10,
+      }),
+    }));
+  } catch (err) {
+    en.result.innerHTML = `<span class="err">Gagal: ${err.message}</span>`;
+  }
+};
+
+en.save.onclick = async () => {
+  try {
+    const result = await enrollCall('/api/enroll/commit', { method: 'POST' });
+    en.result.innerHTML = `<span class="ok">Tersimpan: ${result.name} (id ${result.employee_id}, ${result.samples} sampel${result.avg_similarity ? ', similarity rata-rata ' + result.avg_similarity : ''})</span>`;
+    en.bar.style.width = '0%';
+    en.state.textContent = 'idle';
+    en.name.value = '';
+    en.no.value = '';
+    en.dept.value = '';
+    loadEmployees();
+  } catch (err) {
+    en.result.innerHTML = `<span class="err">Gagal menyimpan: ${err.message}</span>`;
+  }
+};
+
+en.cancel.onclick = async () => {
+  try { renderEnroll(await enrollCall('/api/enroll/cancel', { method: 'POST' })); }
+  catch (err) { en.result.innerHTML = `<span class="err">Gagal: ${err.message}</span>`; }
+};
+
+function renderEmployeeTable(rows) {
+  els.employeeRows.innerHTML = rows.length ? rows.map((e) => `<tr>
+      <td>${e.id}</td>
+      <td>${e.name}</td>
+      <td>${e.dept || '-'}</td>
+      <td>${e.face_count}</td>
+      <td>${e.has_embedding ? '<span class="ok">ada</span>' : '<span class="err">belum</span>'}</td>
+      <td><button data-del="${e.id}">Hapus</button></td>
+    </tr>`).join('') : '<tr><td colspan="6" class="muted">belum ada karyawan terdaftar</td></tr>';
+  els.employeeRows.querySelectorAll('[data-del]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm('Hapus karyawan ini? Sesi lama tetap tercatat tanpa nama.')) return;
+      await enrollCall('/api/employees/' + btn.dataset.del, { method: 'DELETE' });
+      loadEmployees();
+    };
+  });
+}
+
+async function loadEmployees() {
+  try {
+    const data = await api('/api/employees');
+    employeeMap = Object.fromEntries(data.employees.map((e) => [e.id, e]));
+    renderEmployeeTable(data.employees);
+  } catch (err) { /* biarkan tabel kosong */ }
+}
+
+document.getElementById('btnRefresh').onclick = () => { loadLive(); loadSessions(); loadSummaries(); loadEvents(); loadAssignments(); loadEmployees(); };
+
+async function tick() {
+  els.clock.textContent = new Date().toLocaleTimeString('id-ID');
+  await loadLive();
+  await loadSessions();
+}
+
+async function boot() {
+  await loadAssignments();
+  await loadSummaries();
+  await loadEvents();
+  startStream();
+  await tick();
+  await pollEnroll();
+  setInterval(tick, POLL_MS);
+  setInterval(pollEnroll, 1000);
+  setInterval(() => { loadSummaries(); loadEvents(); }, 60000);
+}
+boot();
+</script>
+</body>
+</html>

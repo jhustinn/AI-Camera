@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+
+# Models and weights
+*.pt
+models/
+models/*.onnx
+models/*.pt
+
+# Runtime data & logs
+data/*.log*
+data/*.err*
+data/*.jpg
+data/*.png
+data/events.csv
+data/last_frame.jpg
+data/reload_faces.flag
+data/screenshots/
+data/tracker_*.yaml
+data/samples/
+data/demo/
+data/seq/
+config.yaml.bak
