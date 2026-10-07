@@ -114,7 +114,6 @@ class PersonDetector:
             classes=self._cfg.classes,
             device=self._device,
             tracker=str(self._tracker_cfg),
-            half=(self._device != "cpu"),
             verbose=False,
         )
         self._frame_id += 1
