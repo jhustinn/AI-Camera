@@ -294,6 +294,7 @@ class PoseEstimator:
             conf=self._cfg.confidence,
             imgsz=self._cfg.imgsz,
             device=self._device,
+            half=(self._device != "cpu"),
             verbose=False,
         )
         skeletons: list[Skeleton] = []

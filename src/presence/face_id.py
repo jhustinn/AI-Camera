@@ -78,35 +78,38 @@ class SFaceIdentifier:
         if image.size == 0:
             return []
         height, width = image.shape[:2]
-        upscale = float(self._cfg.upscale)
-        if upscale > 1.0:
-            width = int(width * upscale)
-            height = int(height * upscale)
-            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC)
-        self._detector.setInputSize((width, height))
+        upscale = 1.0
+        det_image = image
+        if min(height, width) < 160 and float(self._cfg.upscale) > 1.0:
+            upscale = float(self._cfg.upscale)
+            det_w = int(width * upscale)
+            det_h = int(height * upscale)
+            det_image = cv2.resize(image, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_w, det_h = width, height
+
+        self._detector.setInputSize((det_w, det_h))
         try:
-            _, faces = self._detector.detect(image)
+            _, faces = self._detector.detect(det_image)
         except cv2.error as exc:
             LOGGER.warning("yunet detect failed: %s", exc)
             return []
-        if faces is None:
+        if faces is None or len(faces) == 0:
             return []
-        min_face = min_face_px / max(1.0, upscale)
+        min_face = min_face_px
         crops: list[np.ndarray] = []
         for face in faces:
-            x, y, fw, fh = [int(v) for v in face[:4]]
+            x = int(face[0] / upscale)
+            y = int(face[1] / upscale)
+            fw = int(face[2] / upscale)
+            fh = int(face[3] / upscale)
             if min_face and (fw < min_face or fh < min_face):
                 continue
-            if x < 0 or y < 0 or x + fw >= width or y + fh >= height:
-                pad = np.zeros((fh, fw, 3), dtype=np.uint8)
-                x0, y0 = max(0, x), max(0, y)
-                x1, y1 = min(width, x + fw), min(height, y + fh)
-                if x1 <= x0 or y1 <= y0:
-                    continue
-                pad[: y1 - y0, : x1 - x0] = image[y0:y1, x0:x1]
-                crops.append(pad)
-            else:
-                crops.append(image[y : y + fh, x : x + fw])
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(width, x + fw), min(height, y + fh)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crops.append(image[y0:y1, x0:x1])
         return crops
 
     def embed(self, aligned_face: np.ndarray) -> np.ndarray:
@@ -114,7 +117,64 @@ class SFaceIdentifier:
         vector = np.asarray(vector, dtype=np.float32).reshape(-1)
         return vector / max(float(np.linalg.norm(vector)), 1e-8)
 
+    def get_face_samples(self, image: np.ndarray, min_face_px: int = 0) -> list[np.ndarray]:
+        """Ekstrak 112x112 sampel wajah dengan landmark alignment (alignCrop) serta fallback resize."""
+        if image.size == 0:
+            return []
+        height, width = image.shape[:2]
+        upscale = 1.0
+        det_image = image
+        if min(height, width) < 160 and float(self._cfg.upscale) > 1.0:
+            upscale = float(self._cfg.upscale)
+            det_w = int(width * upscale)
+            det_h = int(height * upscale)
+            det_image = cv2.resize(image, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_w, det_h = width, height
+
+        self._detector.setInputSize((det_w, det_h))
+        try:
+            _, faces = self._detector.detect(det_image)
+        except cv2.error as exc:
+            LOGGER.warning("yunet detect failed: %s", exc)
+            return []
+        if faces is None or len(faces) == 0:
+            return []
+
+        samples: list[np.ndarray] = []
+        for face in faces:
+            fw = float(face[2]) / upscale
+            fh = float(face[3]) / upscale
+            if min_face_px and (fw < min_face_px or fh < min_face_px):
+                continue
+
+            orig_face = face.copy()
+            if upscale > 1.0:
+                orig_face[:14] = orig_face[:14] / upscale
+
+            try:
+                aligned = self._recognizer.alignCrop(image, orig_face)
+                if aligned is not None and aligned.shape[:2] == (112, 112):
+                    samples.append(aligned)
+            except cv2.error:
+                pass
+
+            x = int(orig_face[0])
+            y = int(orig_face[1])
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(width, x + int(fw)), min(height, y + int(fh))
+            if x1 > x0 and y1 > y0:
+                raw_crop = image[y0:y1, x0:x1]
+                if raw_crop.size > 0:
+                    resized = cv2.resize(raw_crop, (112, 112), interpolation=cv2.INTER_LINEAR)
+                    samples.append(resized)
+
+        return samples
+
     def embed_image(self, image: np.ndarray, min_face_px: int = 0) -> np.ndarray | None:
+        samples = self.get_face_samples(image, min_face_px=min_face_px)
+        if samples:
+            return self.embed(samples[0])
         crops = self.detect(image, min_face_px=min_face_px)
         if not crops:
             return None
@@ -125,14 +185,15 @@ class SFaceIdentifier:
         return self.embed(aligned)
 
     def match(self, image: np.ndarray) -> FaceMatch:
-        crops = self.detect(image, min_face_px=self._cfg.min_face_px)
-        if not crops or self._matrix.shape[0] == 0:
+        if image.size == 0 or self._matrix.shape[0] == 0:
+            return FaceMatch(None, None, -1.0)
+        samples = self.get_face_samples(image, min_face_px=self._cfg.min_face_px)
+        if not samples:
             return FaceMatch(None, None, -1.0)
         best = FaceMatch(None, None, -1.0)
         second = -1.0
-        for crop in crops:
-            aligned = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_LINEAR)
-            vector = self.embed(aligned)
+        for sample in samples:
+            vector = self.embed(sample)
             scores = self._matrix @ vector
             if scores.size == 1:
                 order = [0]

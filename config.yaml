@@ -27,17 +27,17 @@ face:
   model: buffalo_l
   providers: [CPUExecutionProvider]
   det_size: [320, 320]
-  similarity_threshold: 0.45
-  min_margin: 0.06
-  run_every_n_frames: 5
+  similarity_threshold: 0.42
+  min_margin: 0.05
+  run_every_n_frames: 4
   region_ratio: 0.55
   region_top_offset: 0.12
   widen: 0.12
   crop_max_width: 640
-  upscale: 2
-  score_threshold: 0.6
+  upscale: 1.5
+  score_threshold: 0.55
   min_face_px: 16
-  votes_required: 3
+  votes_required: 2
 
 presence:
   enter_confirm_sec: 3

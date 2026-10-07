@@ -55,6 +55,8 @@ def resolve_device(requested: str) -> str:
     if wants_cuda and not torch.cuda.is_available():
         LOGGER.warning("CUDA tidak tersedia (torch %s), fallback ke CPU", torch.__version__)
         return "cpu"
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     return requested
 
 
@@ -112,6 +114,7 @@ class PersonDetector:
             classes=self._cfg.classes,
             device=self._device,
             tracker=str(self._tracker_cfg),
+            half=(self._device != "cpu"),
             verbose=False,
         )
         self._frame_id += 1
