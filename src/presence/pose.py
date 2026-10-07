@@ -91,6 +91,19 @@ class Skeleton:
             return (0.0, 0.0)
         return (float(valid[:, 0].mean()), float(valid[:, 1].mean()))
 
+    def torso_center(self, min_conf: float = 0.25) -> tuple[float, float]:
+        # COCO keypoints: 0:nose, 1:left_eye, 2:right_eye, 5:left_shoulder, 6:right_shoulder, 11:left_hip, 12:right_hip
+        torso_indices = [0, 1, 2, 5, 6, 11, 12]
+        pts = [
+            self.keypoints[i, :2]
+            for i in torso_indices
+            if i < len(self.keypoints) and self.keypoints[i, 2] >= min_conf
+        ]
+        if pts:
+            arr = np.asarray(pts)
+            return (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
+        return self.center()
+
     def valid_count(self, min_conf: float) -> int:
         return int((self.keypoints[:, 2] >= min_conf).sum())
 

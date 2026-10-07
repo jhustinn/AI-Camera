@@ -228,6 +228,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             away_grace_sec=int(presence_raw.get("away_grace_sec", 60)),
             min_session_sec=int(presence_raw.get("min_session_sec", 300)),
             desk_overlap_ratio=float(presence_raw.get("desk_overlap_ratio", 0.5)),
+            desk_switch_grace_sec=int(presence_raw.get("desk_switch_grace_sec", 8)),
         ),
         desks=desks,
         pose=PoseConfig(

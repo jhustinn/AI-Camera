@@ -287,12 +287,18 @@ class Recorder:
             if result.fps > 0:
                 self._fps_smooth = result.fps if self._fps_smooth == 0 else 0.8 * self._fps_smooth + 0.2 * result.fps
 
+            self._update_pose(frame, result, cfg.pose.every_n_frames)
+            anchors: dict[int, tuple[float, float]] = {}
+            for track_id, skeleton in self._skeletons.items():
+                anchors[track_id] = skeleton.torso_center()
+
             per_desk = self._desks.assign(
                 result.detections,
                 desk_tuples,
                 frame.shape,
                 cfg.presence.desk_overlap_ratio,
                 time.monotonic(),
+                anchors=anchors,
             )
             observations: dict[int, Observation] = {}
             for desk_id, detection in per_desk.items():
@@ -305,8 +311,6 @@ class Recorder:
                     similarity=similarity,
                 )
             self._registry.prune({d.track_id for d in result.detections})
-
-            self._update_pose(frame, result, cfg.pose.every_n_frames)
 
             self._maybe_enroll(frame, result.detections)
 

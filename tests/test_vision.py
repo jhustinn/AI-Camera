@@ -173,3 +173,45 @@ def test_registry_prunes_dead_tracks():
     registry.observe(4, FaceMatch(9, "Sari", 0.75))
     registry.prune({5})
     assert registry.identity(4) == (None, None)
+
+
+def test_anchor_inside_overrides_wide_straddling_bounding_box():
+    # Kursi 1: x from 0.03 to 0.42 (38.4px to 537.6px)
+    # Kursi 2: x from 0.42 to 0.85 (537.6px to 1088px)
+    desks = [
+        (1, "Kursi 1", (0.03, 0.10, 0.42, 1.0)),
+        (2, "Kursi 2", (0.42, 0.10, 0.85, 1.0)),
+    ]
+    # Person with arm extending left (x=50 to x=1050)
+    det = Detection(track_id=128, bbox=(50, 100, 1050, 700), conf=0.9)
+    # Torso/skeleton anchor is firmly in Kursi 2 (x=700, y=350)
+    anchor = (700.0, 350.0)
+
+    assigner = DeskAssigner(switch_grace_sec=3)
+    assigned = assigner.assign([det], desks, (720, 1280, 3), 0.4, now=0.0, anchors={128: anchor})
+    assert list(assigned) == [2], "Meskipun bounding box melebar ke kiri, anchor torso di Kursi 2 harus membuat orang ter-assign ke Kursi 2"
+
+
+def test_desk_assigner_switches_when_anchor_moves_to_another_desk():
+    desks = [
+        (1, "Kursi 1", (0.03, 0.10, 0.42, 1.0)),
+        (2, "Kursi 2", (0.42, 0.10, 0.85, 1.0)),
+    ]
+    assigner = DeskAssigner(switch_grace_sec=3)
+    # Initially in Kursi 1
+    det1 = Detection(track_id=128, bbox=(100, 100, 450, 700), conf=0.9)
+    anchor1 = (250.0, 350.0)
+    assigned = assigner.assign([det1], desks, (720, 1280, 3), 0.4, now=0.0, anchors={128: anchor1})
+    assert list(assigned) == [1]
+
+    # Moves to Kursi 2 with arm still overlapping Kursi 1
+    det2 = Detection(track_id=128, bbox=(50, 100, 1050, 700), conf=0.9)
+    anchor2 = (700.0, 350.0)
+
+    # Frame at t=0.2 (pending confirmation window)
+    assigner.assign([det2], desks, (720, 1280, 3), 0.4, now=0.2, anchors={128: anchor2})
+
+    # Frame at t=1.2 (sustained in Kursi 2 past confirm_time 0.8s)
+    assigned_switched = assigner.assign([det2], desks, (720, 1280, 3), 0.4, now=1.2, anchors={128: anchor2})
+    assert list(assigned_switched) == [2], "Setelah konfirmasi singkat, harus beralih ke Kursi 2"
+    assert assigner.desk_of(128) == 2

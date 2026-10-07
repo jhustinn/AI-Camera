@@ -33,6 +33,11 @@ class Detection:
         x1, y1, x2, y2 = self.bbox
         return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
+    @property
+    def upper_center(self) -> tuple[float, float]:
+        x1, y1, x2, y2 = self.bbox
+        return ((x1 + x2) / 2.0, y1 + 0.35 * max(1, y2 - y1))
+
 
 @dataclass
 class DetectionResult:
@@ -172,29 +177,62 @@ def candidate_desks(
     desks: list[tuple[int, str, tuple[float, float, float, float]]],
     frame_shape: tuple[int, int],
     min_ratio: float = 0.5,
+    anchor: tuple[float, float] | None = None,
 ) -> list[tuple[int, float, bool]]:
     height, width = frame_shape[:2]
     x1, y1, x2, y2 = detection.bbox
     area = max(1, (x2 - x1) * (y2 - y1))
     center_x, center_y = detection.center
+
+    # Anchor prioritizes torso/head if available, otherwise upper body center
+    if anchor is not None and anchor != (0.0, 0.0):
+        anchor_x, anchor_y = anchor
+    else:
+        anchor_x, anchor_y = detection.upper_center
+
     candidates: list[tuple[int, float, bool]] = []
     for desk_id, _label, roi in desks:
         rx1, ry1 = roi[0] * width, roi[1] * height
         rx2, ry2 = roi[2] * width, roi[3] * height
+
         inter_w = max(0.0, min(x2, rx2) - max(x1, rx1))
         inter_h = max(0.0, min(y2, ry2) - max(y1, ry1))
         inter = inter_w * inter_h
+
+        anchor_inside = rx1 <= anchor_x <= rx2 and ry1 <= anchor_y <= ry2
         center_inside = rx1 <= center_x <= rx2 and ry1 <= center_y <= ry2
+
         if inter <= 0:
-            if center_inside:
-                candidates.append((desk_id, 0.5, True))
+            if anchor_inside or center_inside:
+                candidates.append((desk_id, 2.5 if anchor_inside else 0.5, anchor_inside or center_inside))
             continue
+
         ratio_person = inter / area
-        ratio_desk = inter / max(1.0, (rx2 - rx1) * (ry2 - ry1))
-        if not (center_inside or ratio_person >= min_ratio or ratio_desk >= min_ratio):
+        desk_area = max(1.0, (rx2 - rx1) * (ry2 - ry1))
+        ratio_desk = inter / desk_area
+
+        # A desk is a candidate if:
+        # 1. Anchor (torso/head) is inside the desk, OR
+        # 2. Bbox center is inside the desk, OR
+        # 3. Person's body overlap is substantial (>= min_ratio), OR
+        # 4. Desk is covered (>= min_ratio) AND person is at least moderately inside (>= 0.25)
+        is_candidate = (
+            anchor_inside
+            or center_inside
+            or ratio_person >= min_ratio
+            or (ratio_desk >= min_ratio and ratio_person >= 0.25)
+        )
+        if not is_candidate:
             continue
-        score = 2.0 * ratio_person + ratio_desk + (1.0 if center_inside else 0.0)
-        candidates.append((desk_id, score, center_inside))
+
+        # Score gives strong weight to anchor_inside (the chair where body/head is seated)
+        score = (
+            3.0 * ratio_person
+            + (3.5 if anchor_inside else 0.0)
+            + (1.0 if center_inside else 0.0)
+            + 0.5 * min(1.0, ratio_desk)
+        )
+        candidates.append((desk_id, score, anchor_inside or center_inside))
     return candidates
 
 
@@ -203,10 +241,12 @@ def assign_to_desks(
     desks: list[tuple[int, str, tuple[float, float, float, float]]],
     frame_shape: tuple[int, int],
     min_ratio: float = 0.5,
+    anchors: dict[int, tuple[float, float]] | None = None,
 ) -> dict[int, Detection]:
     per_desk: dict[int, tuple[float, Detection]] = {}
     for detection in detections:
-        candidates = candidate_desks(detection, desks, frame_shape, min_ratio)
+        anchor = anchors.get(detection.track_id) if anchors else None
+        candidates = candidate_desks(detection, desks, frame_shape, min_ratio, anchor=anchor)
         if not candidates:
             continue
         desk_id, score, _center = max(candidates, key=lambda item: item[1])
@@ -219,6 +259,7 @@ class DeskAssigner:
     def __init__(self, switch_grace_sec: float = 8.0) -> None:
         self.switch_grace_sec = switch_grace_sec
         self._assignment: dict[int, tuple[int, float]] = {}
+        self._pending_switch: dict[int, tuple[int, float]] = {}
 
     def assign(
         self,
@@ -227,35 +268,96 @@ class DeskAssigner:
         frame_shape: tuple[int, int],
         min_ratio: float,
         now: float,
+        anchors: dict[int, tuple[float, float]] | None = None,
     ) -> dict[int, Detection]:
-        result: dict[int, Detection] = {}
+        assigned_candidates: list[tuple[int, float, Detection]] = []
         seen: set[int] = set()
+
         for detection in detections:
             track_id = detection.track_id
             if track_id < 0:
                 continue
             seen.add(track_id)
-            candidates = candidate_desks(detection, desks, frame_shape, min_ratio)
-            candidate_ids = {desk_id for desk_id, _score, _center in candidates}
+
+            anchor = anchors.get(track_id) if anchors else None
+            candidates = candidate_desks(detection, desks, frame_shape, min_ratio, anchor=anchor)
+
+            if not candidates:
+                previous = self._assignment.get(track_id)
+                if previous is not None:
+                    prev_desk, last_seen = previous
+                    if now - last_seen < self.switch_grace_sec:
+                        assigned_candidates.append((prev_desk, 0.5, detection))
+                    else:
+                        self._assignment.pop(track_id, None)
+                        self._pending_switch.pop(track_id, None)
+                continue
+
+            best_desk, best_score, best_anchor_inside = max(candidates, key=lambda item: item[1])
+
             previous = self._assignment.get(track_id)
-            if previous is not None:
-                prev_desk, last_seen = previous
-                if prev_desk in candidate_ids:
-                    self._assignment[track_id] = (prev_desk, now)
-                    result[prev_desk] = detection
-                    continue
-                if now - last_seen < self.switch_grace_sec:
-                    result[prev_desk] = detection
-                    continue
-            if candidates:
-                desk_id = max(candidates, key=lambda item: item[1])[0]
-                self._assignment[track_id] = (desk_id, now)
-                result[desk_id] = detection
-            else:
-                self._assignment.pop(track_id, None)
+            if previous is None:
+                self._assignment[track_id] = (best_desk, now)
+                self._pending_switch.pop(track_id, None)
+                assigned_candidates.append((best_desk, best_score, detection))
+                continue
+
+            prev_desk, last_seen = previous
+            if best_desk == prev_desk:
+                self._assignment[track_id] = (prev_desk, now)
+                self._pending_switch.pop(track_id, None)
+                assigned_candidates.append((prev_desk, best_score, detection))
+                continue
+
+            # best_desk != prev_desk: check if previous desk is still a valid candidate
+            prev_match = next((c for c in candidates if c[0] == prev_desk), None)
+            if prev_match is None:
+                # prev_desk has zero candidate overlap now
+                if now - last_seen >= self.switch_grace_sec:
+                    self._assignment[track_id] = (best_desk, now)
+                    self._pending_switch.pop(track_id, None)
+                    assigned_candidates.append((best_desk, best_score, detection))
+                else:
+                    assigned_candidates.append((prev_desk, 0.5, detection))
+                continue
+
+            # Both prev_desk and best_desk are candidates
+            prev_score, prev_anchor_inside = prev_match[1], prev_match[2]
+
+            # Clear switch condition:
+            # 1. best_desk contains anchor while prev_desk does not, OR
+            # 2. best_score is substantially higher than prev_score
+            should_switch = (
+                (best_anchor_inside and not prev_anchor_inside)
+                or (best_score >= prev_score * 1.35 + 0.5)
+            )
+
+            if should_switch:
+                pending = self._pending_switch.get(track_id)
+                confirm_time = 0.8 if best_anchor_inside else min(2.0, self.switch_grace_sec / 2)
+                if pending is not None and pending[0] == best_desk:
+                    if (now - pending[1]) >= confirm_time:
+                        self._assignment[track_id] = (best_desk, now)
+                        self._pending_switch.pop(track_id, None)
+                        assigned_candidates.append((best_desk, best_score, detection))
+                        continue
+                else:
+                    self._pending_switch[track_id] = (best_desk, now)
+
+            # Keep previous desk while switch is pending or not meeting threshold
+            self._assignment[track_id] = (prev_desk, now)
+            assigned_candidates.append((prev_desk, prev_score, detection))
+
         for stale in [t for t in self._assignment if t not in seen]:
             self._assignment.pop(stale, None)
-        return result
+            self._pending_switch.pop(stale, None)
+
+        result: dict[int, tuple[float, Detection]] = {}
+        for desk_id, score, det in assigned_candidates:
+            if desk_id not in result or score > result[desk_id][0]:
+                result[desk_id] = (score, det)
+
+        return {desk_id: det for desk_id, (_s, det) in result.items()}
 
     def desk_of(self, track_id: int) -> int | None:
         entry = self._assignment.get(track_id)

@@ -40,12 +40,12 @@ face:
   votes_required: 3
 
 presence:
-  enter_confirm_sec: 5
-  leave_confirm_sec: 4
+  enter_confirm_sec: 3
+  leave_confirm_sec: 3
   away_grace_sec: 60
   min_session_sec: 300
   desk_overlap_ratio: 0.4
-  desk_switch_grace_sec: 8
+  desk_switch_grace_sec: 3
 
 pose:
   enabled: true
