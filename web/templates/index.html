@@ -27,6 +27,12 @@
   section { background: var(--panel); border: 1px solid #334155; border-radius: 12px; padding: 16px 18px; }
   section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+  .cams { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; }
+  .cams .card { padding: 10px; }
+  .cams .card h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
+  .cams img { display: block; width: 100%; aspect-ratio: 11 / 9; object-fit: cover; background: #0b1220; border-radius: 8px; border: 1px solid #334155; }
+  .cams img[data-ok="0"] { border-color: var(--away); min-height: 60px; }
+  .cams img[data-ok="1"] { border-color: var(--ok); }
   .card { background: var(--panel-2); border-radius: 10px; padding: 14px; border-left: 4px solid var(--muted); }
   .card.present { border-left-color: var(--ok); }
   .card.away { border-left-color: var(--away); }
@@ -67,6 +73,12 @@
 </header>
 
 <main>
+  <section>
+    <h2>Pratinjau Kamera <span class="muted" id="streamMeta">(live {{ stream_fps }} fps)</span></h2>
+    <div id="cameraGrid" class="cams"><span class="muted">memuat kamera...</span></div>
+    <p class="muted" id="streamHint">Menghubungkan ke recorder (MJPEG) di port {{ stream_port }}...</p>
+  </section>
+
   <section>
     <h2>Status Real-time per Kursi</h2>
     <div class="cards" id="deskCards"><span class="muted">memuat data...</span></div>
@@ -162,14 +174,6 @@
       </div>
     </section>
   </div>
-
-  <section>
-    <h2>Pratinjau Kamera <span class="muted" id="streamMeta">(live {{ stream_fps }} fps)</span></h2>
-    <div>
-      <img id="cameraFrame" alt="pratinjau live kamera" style="max-width:100%;border-radius:10px;border:1px solid #334155" />
-    </div>
-    <p class="muted" id="streamHint">Menghubungkan ke recorder (MJPEG) di port {{ stream_port }}...</p>
-  </section>
 </main>
 
 <footer>
@@ -192,39 +196,62 @@ const els = {
   employeeRows: document.getElementById('employeeRows'),
   deskAssignRows: document.getElementById('deskAssignRows'),
   eventRows: document.getElementById('eventRows'),
-  frame: document.getElementById('cameraFrame'),
+  cameraGrid: document.getElementById('cameraGrid'),
   streamHint: document.getElementById('streamHint'),
   streamMeta: document.getElementById('streamMeta'),
   exportLink: document.getElementById('btnExport'),
 };
 
-function attachStream(img, onFail) {
-  let target = STREAM_URL;
+function attachStream(img, url, onFail) {
+  const withStamp = (u) => u + (u.includes('?') ? '&' : '?') + 't=' + Date.now();
   img.onload = () => { img.dataset.ok = '1'; };
   img.onerror = () => {
     img.dataset.ok = '0';
     if (onFail) onFail();
-    if (target === STREAM_URL && location.protocol === 'http:' && location.port !== '{{ stream_port }}') {
-      target = STREAM_PROXY;
-      img.src = target + '?t=' + Date.now();
-      return;
-    }
-    setTimeout(() => { img.src = target + '?t=' + Date.now(); }, 4000);
+    setTimeout(() => { img.src = withStamp(url); }, 4000);
   };
-  img.src = target + '?t=' + Date.now();
+  img.src = withStamp(url);
+}
+
+let cameraSignature = '';
+
+async function loadCameraStreams() {
+  let cameras = [];
+  try {
+    cameras = (await api('/api/cameras')).cameras || [];
+  } catch (err) {
+    els.streamHint.textContent = 'Daftar kamera tidak bisa dimuat (recorder/dashboard?).';
+    return;
+  }
+  const active = cameras.filter((c) => c.stream_url);
+  const signature = active.map((c) => c.camera_key + '@' + c.stream_url).join('|');
+  if (signature === cameraSignature) return;
+  cameraSignature = signature;
+  if (!active.length) {
+    els.cameraGrid.innerHTML = '<span class="muted">belum ada kamera di config aktif</span>';
+    return;
+  }
+  els.cameraGrid.innerHTML = active.map((c) => `
+    <div class="card" data-cam="${c.camera_key}">
+      <h3>${c.name}</h3>
+      <img class="camimg" alt="${c.name}" />
+      <div class="meta">${c.camera_key} &middot; ${c.desk_count} kursi</div>
+    </div>`).join('');
+  els.cameraGrid.querySelectorAll('img.camimg').forEach((img) => {
+    const key = img.closest('.card').dataset.cam;
+    const cam = active.find((c) => c.camera_key === key);
+    attachStream(img, cam.stream_url, () => {
+      img.closest('.card').style.borderLeftColor = '#ef4444';
+    });
+  });
+  els.streamMeta.textContent = active.length + ' kamera &middot; live MJPEG';
+  els.streamHint.textContent = 'Streaming langsung dari recorder. Ctrl+F5 untuk muat ulang bila macet.';
 }
 
 function startStream() {
   els.streamHint.textContent = 'Menghubungkan ke recorder (MJPEG)...';
-  attachStream(en.frame, () => {
-    en.hint.textContent = 'Pratinjau kamera tidak tersambung - pastikan recorder berjalan.';
-  });
-  attachStream(els.frame);
-  els.frame.onload = () => {
-    els.streamHint.textContent = 'Live streaming dari recorder. Teh Ctrl+F5 untuk muat ulang bila macet.';
-    els.streamMeta.textContent = 'live MJPEG';
-  };
-  els.streamMeta.textContent = 'live MJPEG';
+  loadCameraStreams();
+  setInterval(loadCameraStreams, 5000);
 }
 
 const today = new Date();

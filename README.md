@@ -338,7 +338,7 @@ FastAPI menyediakan endpoint RESTful yang siap diintegrasikan dengan sistem HRIS
 Proyek ini dilengkapi dengan rangkaian pengujian komprehensif:
 
 ```powershell
-# Jalankan seluruh unit test (92 test)
+# Jalankan seluruh unit test (124 test)
 .\.venv\Scripts\python.exe -m pytest -q
 
 # Uji coba fungsionalitas inferensi model tanpa kamera/DB fisik
@@ -347,7 +347,95 @@ Proyek ini dilengkapi dengan rangkaian pengujian komprehensif:
 
 ---
 
-## 9. Privasi & Kepatuhan Data
+## 9. CCTV Multi-Kamera
+
+Satu proses rekam per kamera + satu dashboard gabungan.
+**Dokumentasi lengkap: [`docs/CCTV.md`](docs/CCTV.md).**
+
+Ringkasan mekanisme:
+
+- Stream diambil **langsung dari tiap kamera IP** (RTSP 554), bukan lewat NVR.
+  NVR tetap merekam sendiri; sistem ini hanya "menonton".
+- Format URL Dahua:
+  `rtsp://USER:PASS@IP:554/cam/realmonitor?channel=1&subtype=1`
+  - `channel=1` untuk kamera tunggal, `subtype=1` = sub stream 704x576 (ringan).
+- Kredensial dibaca dari `.env` (`CCTV_USER` / `CCTV_PASSWORD`) lewat placeholder
+  `${VAR}`, jadi tidak pernah masuk ke file config yang ter-commit.
+- Template config: `config.cctv.example.yaml` -> salin jadi `config.cctv.yaml`
+  (file ini di-gitignore karena berisi alamat & kredensial).
+
+```yaml
+cameras:
+  - id: cctv-1
+    name: D1 - meja depan
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1
+    stream_port: 8001
+    desks:
+      - {id: 1, label: Meja 1, roi: [0.05, 0.35, 0.30, 0.95]}
+  - id: cctv-2
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.109:554/cam/realmonitor?channel=1&subtype=1
+    stream_port: 8002
+    desks: []
+```
+
+Menjalankan:
+
+```powershell
+Copy-Item config.cctv.example.yaml config.cctv.yaml
+.\.venv\Scripts\python.exe run.py --config config.cctv.yaml all
+```
+
+Dashboard: `http://127.0.0.1:8000` (grid 4 kamera + status kursi).
+
+> `--config` ditulis **sebelum** sub-perintah.
+> **Jangan menjalankan dua instance bersamaan** - batas klien RTSP kamera akan
+> habis. Recorder menolak start bila port MJPEG sudah dipakai proses lain.
+
+### Prasyarat jaringan CCTV
+
+Jaringan CCTV terpisah dari Wi-Fi kantor, jadi PC harus tersambung **kabel LAN**
+ke switch PoE dengan IP statis, dan **tidak boleh** ada konflik IP antara NVR
+dan kamera. Detail lengkap + troubleshooting: [`docs/CCTV.md`](docs/CCTV.md).
+
+### Alat bantu koneksi CCTV
+
+```powershell
+run.py rtsp-test --host 192.168.1.109 --user admin --channels 1 --skip-port-check
+run.py net-scan --subnet 192.168.1
+run.py watch --host 192.168.1.107 --user rtspuser --prompt --start
+```
+
+- `rtsp-test` mencoba 8 pola URL (Hikvision, Dahua, XVR generik) x semua kredensial,
+  lalu melaporkan yang benar-benar menghasilkan frame.
+- `net-scan` memetakan perangkat & port terbuka untuk memeriksa layer 2 / konflik IP.
+- `watch` menunggu port 554 hidup, menemukan URL tiap kanal, menulis ke
+  `config.cctv.yaml` (backup `.bak`), lalu menjalankan `run.py all`.
+
+### Deployment di PC CCTV
+
+1. Install Python di PC admin / mini PC, **bukan** di perangkat NVR/DVR.
+2. `git clone`, `python -m venv .venv`, `pip install -r requirements.txt`,
+   salin `.env.example` jadi `.env`.
+3. Isi `DATABASE_URL`, lalu `run.py setup-db`.
+4. Salin `config.cctv.example.yaml` ke `config.cctv.yaml`, isi `CCTV_USER` /
+   `CCTV_PASSWORD` di `.env`, sesuaikan URL RTSP + ROI tiap meja.
+5. Jalankan `run.py --config config.cctv.yaml all`, lalu aktifkan autostart
+   (Task Scheduler / NSSM / systemd).
+
+## 10. Performa
+
+Diukur di GTX 1650, input 1280x720, kamera USB:
+
+| Tahap | Sebelum | Sesudah |
+|---|---|---|
+| Deteksi + stickman | 2 model: 63 ms + 39 ms = 102 ms/frame | 1 model terpadu: **31 ms/frame** |
+| Loop end-to-end | ~10 fps | **24-29 fps** |
+| Tulis status DB | 1 koneksi per kursi per siklus | 1 koneksi dipakai ulang + batch |
+| Angka FPS di overlay | inferensi model saja | FPS loop nyata + ms/frame |
+
+Uji ulang: python scripts/profile_pipeline.py.
+
+## 11. Privasi & Kepatuhan Data
 
 Sistem ini memproses data biometrik wajah dan mencatat aktivitas kehadiran individu. Disarankan untuk:
 1. Memberikan transparansi dan persetujuan tertulis (*informed consent*) kepada karyawan sesuai **UU No. 27/2022 tentang Pelindungan Data Pribadi (UU PDP)**.

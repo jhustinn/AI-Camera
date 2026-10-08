@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -13,7 +14,7 @@ TEMPLATES_DIR = PACKAGE_ROOT.parents[2] / "web" / "templates"
 
 
 def create_app() -> FastAPI:
-    config = load_config()
+    config = load_config(os.environ.get("PRESENCE_CONFIG"))
     app = FastAPI(title="Employee Presence Monitor", version="1.0.0")
     app.include_router(router)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))

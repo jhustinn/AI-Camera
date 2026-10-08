@@ -24,3 +24,8 @@ data/samples/
 data/demo/
 data/seq/
 config.yaml.bak
+
+# Config CCTV berisi alamat & kredensial kamera -> jangan di-commit.
+# Salin config.cctv.example.yaml menjadi config.cctv.yaml.
+# Kredensial dibaca dari .env (CCTV_USER / CCTV_PASSWORD).
+config.cctv.yaml

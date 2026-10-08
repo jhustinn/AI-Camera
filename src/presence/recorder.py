@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -16,8 +18,13 @@ import cv2
 import numpy as np
 from pydantic import BaseModel
 
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|timeout;5000000|stimeout;5000000",
+)
+
 from . import db
-from .config import AppConfig, load_config
+from .config import AppConfig, CameraChannel, load_config
 from .detector import DeskAssigner, Detection, PersonDetector, draw_rois, face_region
 from .enroll import EnrollmentSession
 from .face_id import FaceMatch, TrackIdentityRegistry, build_identifier
@@ -74,8 +81,10 @@ class Recorder:
         preview: bool = True,
         save_frames: bool = True,
         stream: bool = True,
+        channel: CameraChannel | None = None,
     ) -> None:
         self._cfg = cfg
+        self._channel = channel
         self._source = cfg.camera.source if source is None else source
         self._backend = backend
         self._preview = preview and not _is_file_source(self._source)
@@ -84,6 +93,8 @@ class Recorder:
         self._tz = cfg.local_tz()
         self._stop = False
         self._capture: cv2.VideoCapture | None = None
+        self._is_network = False
+        self._reconnect_attempts = 0
         self._camera_id = 0
         self._engine: PresenceEngine | None = None
         self._detector: PersonDetector | None = None
@@ -96,6 +107,7 @@ class Recorder:
         self._last_publish = 0.0
         self._last_snapshot = 0.0
         self._fps_smooth = 0.0
+        self._model_fps = 0.0
         self._frame_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
         self._latest_frame: Any = None
@@ -108,6 +120,9 @@ class Recorder:
         self._skeleton_miss: dict[int, int] = {}
         self._postures: dict[int, str] = {}
         self._pose_fps = 0.0
+        self._last_pipeline_ms = 0.0
+        self._loop_start = time.monotonic()
+        self._loop_frames = 0
         self._enroll: EnrollmentSession | None = None
         self._enroll_last: dict[str, Any] | None = None
 
@@ -121,6 +136,18 @@ class Recorder:
     def run(self) -> int:
         cfg = self._cfg
         self._shot_dir.mkdir(parents=True, exist_ok=True)
+        channel = self._channel
+        if channel is not None:
+            cfg.camera.id = channel.id
+            cfg.camera.name = channel.name
+            cfg.camera.source = self._source = channel.source
+            cfg.camera.width = channel.width
+            cfg.camera.height = channel.height
+            cfg.camera.fps = channel.fps
+            cfg.camera.fourcc = channel.fourcc
+            cfg.camera.backend = channel.backend
+            cfg.server.stream_port = channel.stream_port
+            cfg.desks = channel.desks
         self._camera_id = db.ensure_camera(cfg.camera.id, cfg.camera.name, str(self._source))
         db.sync_desks(
             self._camera_id,
@@ -159,8 +186,10 @@ class Recorder:
 
         LOGGER.info("loading detector (%s on %s)", cfg.detection.model, cfg.detection.device)
         self._detector = PersonDetector(cfg.detection, PROJECT_ROOT)
-
-        if cfg.pose.enabled:
+        self._unified = bool(self._detector.has_keypoints)
+        if self._unified:
+            LOGGER.info("mode terpadu: satu model untuk deteksi + pelacakan + stickman")
+        elif cfg.pose.enabled:
             try:
                 self._pose = PoseEstimator(cfg.pose, PROJECT_ROOT)
                 LOGGER.info("stickman aktif (model=%s on %s)", cfg.pose.model, self._pose.device)
@@ -222,50 +251,112 @@ class Recorder:
             "any": cv2.CAP_ANY,
             "dshow": cv2.CAP_DSHOW,
             "msmf": cv2.CAP_MSMF,
+            "ffmpeg": cv2.CAP_FFMPEG,
         }
         backend = backends.get(cfg.backend.lower(), cv2.CAP_ANY)
-        LOGGER.info("opening source %s (backend=%s)", self._source, cfg.backend)
-        capture = cv2.VideoCapture(self._source, backend)
-        if not capture.isOpened() and backend != cv2.CAP_ANY:
-            capture.release()
-            capture = cv2.VideoCapture(self._source)
-        if not capture.isOpened():
-            LOGGER.error("cannot open source %s", self._source)
-            return False
-
-        if isinstance(self._source, str) and not self._source.isdigit():
+        is_network = isinstance(self._source, str) and self._source.lower().startswith(
+            ("rtsp://", "rtmp://", "http://", "https://")
+        )
+        if is_network:
+            LOGGER.info("membuka stream jaringan: %s", _mask_source(self._source))
+            capture = cv2.VideoCapture(self._source, cv2.CAP_FFMPEG)
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+            capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000)
         else:
+            LOGGER.info("opening source %s (backend=%s)", self._source, cfg.backend)
+            capture = cv2.VideoCapture(self._source, backend)
+            if not capture.isOpened() and backend != cv2.CAP_ANY:
+                capture.release()
+                capture = cv2.VideoCapture(self._source)
             if cfg.fourcc and len(cfg.fourcc) == 4:
                 capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cfg.fourcc))
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
             capture.set(cv2.CAP_PROP_FPS, cfg.fps)
+        if not capture.isOpened():
+            LOGGER.error("cannot open source %s", _mask_source(self._source))
+            return False
 
         actual_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = float(capture.get(cv2.CAP_PROP_FPS))
         LOGGER.info(
-            "camera aktif: %sx%s @ %.1f fps (diminta %sx%s @ %d, fourcc=%s)",
+            "camera aktif: %sx%s @ %.1f fps%s",
             actual_w,
             actual_h,
             actual_fps,
-            cfg.width,
-            cfg.height,
-            cfg.fps,
-            cfg.fourcc or "-",
+            f" (diminta {cfg.width}x{cfg.height})" if not is_network else "",
         )
         self._capture = capture
+        self._is_network = is_network
         return True
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """Tidur dalam potongan kecil agar Ctrl+C tetap responsif."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._stop:
+                return False
+            time.sleep(0.2)
+        return not self._stop
+
+    def _reconnect(self) -> bool:
+        """Sambung ulang stream jaringan, berulang sampai berhasil.
+
+        Kabel LAN ke switch PoE sering goyah. Dulu Recorder menyerah setelah satu
+        percobaan, sehingga kamera yang kembali online 5 detik kemudian tetap
+        tidak tertangkap sampai proses dimulai ulang.
+        """
+        while not self._stop:
+            if self._capture is not None:
+                try:
+                    self._capture.release()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._capture = None
+            delay = min(30.0, 2.0 * (2 ** min(self._reconnect_attempts, 4)))
+            self._reconnect_attempts += 1
+            LOGGER.warning(
+                "stream terputus, mencoba sambung lagi dalam %.0f dtk (percobaan %d)",
+                delay,
+                self._reconnect_attempts,
+            )
+            if not self._sleep_interruptible(delay):
+                return False
+            if self._open_capture():
+                self._reconnect_attempts = 0
+                LOGGER.info("stream tersambung kembali")
+                return True
+        return False
 
     def _loop(self, desks: list[DeskView]) -> int:
         assert self._engine is not None and self._detector is not None
         cfg = self._cfg
-        if not self._open_capture():
-            return 2
+        attempt = 0
+        while not self._stop:
+            if self._open_capture():
+                break
+            if not _is_network_source(self._source):
+                return 2
+            attempt += 1
+            delay = min(30.0, 2.0 * (2 ** min(attempt, 4)))
+            LOGGER.warning(
+                "stream belum tersedia, mencoba lagi dalam %.0f dtk (percobaan %d)",
+                delay,
+                attempt,
+            )
+            self._stop = False
+            time.sleep(delay)
+        if self._stop:
+            return 0
 
         desk_tuples = [(d.desk_id, d.label, d.roi) for d in desks]
         read_failures = 0
+        # Untuk stream jaringan, tiap read yang gagal bisa blocking sampai
+        # READ_TIMEOUT_MSEC (10 dtk), jadi ambang 30 berarti ~5 menit sebelum
+        # reconnect. 5 kegagalan cukup untuk memutuskan stream sudah putus.
+        max_failures = 5 if _is_network_source(self._source) else 30
         frame: Any = None
         LOGGER.info("recording started (q=quit)")
 
@@ -276,16 +367,25 @@ class Recorder:
                 if _is_file_source(self._source):
                     LOGGER.info("end of file reached")
                     break
-                if read_failures > 30:
+                if read_failures > max_failures:
+                    if self._is_network and not self._stop and self._reconnect():
+                        continue
                     LOGGER.error("too many failed reads, stopping")
                     break
                 time.sleep(0.05)
                 continue
             read_failures = 0
+            frame_start = time.monotonic()
+            self._loop_frames += 1
+            elapsed = time.monotonic() - self._loop_start
+            if elapsed >= 1.0:
+                self._fps_smooth = self._loop_frames / elapsed
+                self._loop_frames = 0
+                self._loop_start = time.monotonic()
 
             result = self._detector.track(frame)
             if result.fps > 0:
-                self._fps_smooth = result.fps if self._fps_smooth == 0 else 0.8 * self._fps_smooth + 0.2 * result.fps
+                self._model_fps = result.fps if self._model_fps == 0 else 0.8 * self._model_fps + 0.2 * result.fps
 
             self._update_pose(frame, result, cfg.pose.every_n_frames)
             anchors: dict[int, tuple[float, float]] = {}
@@ -319,6 +419,7 @@ class Recorder:
                 self._handle_events(events, frame)
 
             self._publish_frame(frame, observations, desk_tuples)
+            self._last_pipeline_ms = (time.monotonic() - frame_start) * 1000.0
 
             now_ts = time.monotonic()
             if now_ts - self._last_publish >= cfg.server.poll_seconds:
@@ -424,21 +525,20 @@ class Recorder:
             session.last_error = None
 
     def _update_pose(self, frame: Any, result: Any, every_n_frames: int) -> None:
-        if self._pose is None:
-            return
         cfg = self._cfg.pose
-        due = every_n_frames <= 0 or result.frame_id % every_n_frames == 0
-        if not due:
-            return
-        start = time.perf_counter()
-        skeletons = self._pose.estimate(frame)
-        elapsed = time.perf_counter() - start
-        if elapsed > 0:
-            self._pose_fps = 1.0 / elapsed if self._pose_fps == 0 else 0.8 * self._pose_fps + 0.2 / elapsed
-
         skeletons_out: dict[int, Skeleton] = {}
         postures: dict[int, str] = {}
         seen_tracks: set[int] = set()
+
+        if self._unified:
+            due = every_n_frames <= 0 or result.frame_id % every_n_frames == 0
+            candidates = [d for d in result.detections if d.keypoints is not None]
+        else:
+            due = every_n_frames <= 0 or result.frame_id % every_n_frames == 0
+            candidates = []
+            if due and self._pose is not None:
+                candidates = self._pose.estimate(frame)
+
         for detection in result.detections:
             track_id = detection.track_id
             if track_id < 0:
@@ -446,14 +546,27 @@ class Recorder:
             stored = self._skeleton_state.get(track_id)
             missed = self._skeleton_miss.get(track_id, 0)
             accepted = False
-            candidates = [s for s in skeletons if s.score >= cfg.min_score]
-            if candidates:
-                cx, cy = detection.center
-                nearest = min(
-                    candidates,
-                    key=lambda s: float(np.linalg.norm(np.array(s.center()) - np.array([cx, cy]))),
-                )
-                clipped, in_box_ratio = clip_to_bbox(nearest, detection.bbox, cfg.bbox_margin)
+            if due and candidates:
+                if self._unified:
+                    nearest = candidates[0] if len(candidates) == 1 else min(
+                        candidates,
+                        key=lambda d: float(
+                            np.linalg.norm(
+                                np.array((d.center[0], d.center[1]))
+                                - np.array((detection.center[0], detection.center[1]))
+                            )
+                        ),
+                    )
+                    source = nearest.keypoints
+                else:
+                    cx, cy = detection.center
+                    nearest = min(
+                        candidates,
+                        key=lambda s: float(np.linalg.norm(np.array(s.center()) - np.array([cx, cy]))),
+                    )
+                    source = nearest.keypoints
+                skeleton = Skeleton(keypoints=np.asarray(source, dtype=np.float32), score=detection.conf)
+                clipped, in_box_ratio = clip_to_bbox(skeleton, detection.bbox, cfg.bbox_margin)
                 if cfg.validate_limbs:
                     clipped = validate_skeleton(
                         clipped,
@@ -585,6 +698,20 @@ class Recorder:
         from fastapi.responses import StreamingResponse
         from uvicorn import Config, Server
 
+        # Pre-flight: port sudah dipakai instance lain? uvicorn bind di dalam
+        # thread, jadi error-nya hanya muncul di log dan recorder tetap jalan
+        # tanpa MJPEG (deteksi ganda ke kamera yang sama). Stop di sini saja.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((cfg.stream_host or "0.0.0.0", cfg.stream_port))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"port MJPEG {cfg.stream_port} sudah dipakai proses lain "
+                    f"({exc}). Kemungkinan ada instance recorder ganda yang masih "
+                    f"jalan - hentikan dulu, jangan biarkan 2 recorder menarik "
+                    f"kamera yang sama (batas klien kamera akan habis)."
+                ) from exc
+
         recorder = self
 
         app = FastAPI(title="Employee Presence Stream", docs_url=None, redoc_url=None)
@@ -700,8 +827,15 @@ headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
                 color = (90, 90, 230)
             cv2.putText(overlay, text, (12, 46 + 26 * index),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(overlay, f"fps {self._fps_smooth:.0f}", (overlay.shape[1] - 110, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(
+            overlay,
+            f"loop {self._fps_smooth:4.0f} fps | model {self._model_fps:4.0f} fps | {self._last_pipeline_ms:4.0f} ms/frame",
+            (12, overlay.shape[0] - 44),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (215, 215, 215),
+            2,
+        )
         if self._cfg.pose.posture_labels:
             labels: list[str] = []
             for track_id, skeleton in self._skeletons.items():
@@ -748,24 +882,29 @@ headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         assert self._engine is not None
         self._maybe_reload_faces()
         snapshot = self._engine.snapshot(self._now())
+        rows = []
         for row in snapshot:
-            payload = {
-                "desk_id": self._desk_db_ids.get(row["desk_id"], row["desk_id"]),
-                "label": row["label"],
-                "status": row["status"],
-                "employee_id": row["employee_id"],
-                "employee_name": row["employee_name"],
-                "track_id": row["track_id"],
-                "sit_since": row["sit_since"],
-                "duration_sec": row["duration_sec"],
-                "away_sec": row["away_sec"],
-                "session_id": row["session_id"],
-                "fps": round(self._fps_smooth, 2),
-            }
-            try:
-                db.upsert_live_status(payload)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.error("live status update failed: %s", exc)
+            rows.append(
+                {
+                    "desk_id": self._desk_db_ids.get(row["desk_id"], row["desk_id"]),
+                    "label": row["label"],
+                    "status": row["status"],
+                    "employee_id": row["employee_id"],
+                    "employee_name": row["employee_name"],
+                    "track_id": row["track_id"],
+                    "sit_since": row["sit_since"],
+                    "duration_sec": row["duration_sec"],
+                    "away_sec": row["away_sec"],
+                    "session_id": row["session_id"],
+                    "fps": round(self._fps_smooth, 2),
+                }
+            )
+        if not rows:
+            return
+        try:
+            db.upsert_live_status_many(rows)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("live status update failed: %s", exc)
 
     def _maybe_reload_faces(self) -> None:
         flag = self._reload_flag
@@ -796,10 +935,41 @@ headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         LOGGER.info("recording stopped")
 
 
+NETWORK_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://")
+
+
+def _is_network_source(source: Any) -> bool:
+    return isinstance(source, str) and source.lower().startswith(NETWORK_SCHEMES)
+
+
+def _mask_source(source: Any) -> str:
+    text = str(source)
+    if "@" in text and "//" in text:
+        scheme, rest = text.split("//", 1)
+        credentials, host = rest.split("@", 1)
+        return f"{scheme}//{credentials.split(':')[0]}:***@{host}"
+    return text
+
+
 def _is_file_source(source: Any) -> bool:
-    if isinstance(source, str):
-        return not source.isdigit()
-    return False
+    """True HANYA untuk file video di disk.
+
+    Dulu ini `not source.isdigit()`, sehingga setiap URL RTSP ikut dianggap
+    file. Akibatnya begitu satu read gagal, recorder mencetak "end of file
+    reached" lalu berhenti permanen - tidak pernah mencoba reconnect, padahal
+    kameranya masih hidup. Thread MJPEG tetap melayani frame basi sehingga
+    dashboard tampak normal padahal deteksi sudah mati.
+    """
+    if not isinstance(source, str):
+        return False
+    if _is_network_source(source):
+        return False
+    text = source.strip()
+    if not text:
+        return False
+    if text.isdigit():
+        return False  # index kamera (0, 1, ...)
+    return True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -810,6 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-preview", action="store_true", help="jangan tampilkan window OpenCV")
     parser.add_argument("--no-save-frames", action="store_true", help="jangan simpan frame/screenshot")
     parser.add_argument("--no-stream", action="store_true", help="jangan jalankan server MJPEG")
+    parser.add_argument("--camera-id", default=None, help="pilih kamera dari daftar cameras:")
     return parser
 
 
@@ -821,9 +992,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     source: Any = args.source if args.source is None else int(args.source) if args.source.isdigit() else args.source
+    channel = None
+    if args.camera_id:
+        channel = next((c for c in cfg.channels if c.id == args.camera_id), None)
+        if channel is None:
+            available = ", ".join(c.id for c in cfg.channels)
+            print(f"kamera '{args.camera_id}' tidak ada di config. Tersedia: {available}")
+            return 2
+        source = None
     recorder = Recorder(
         cfg,
         source=source,
+        channel=channel,
         backend=args.backend,
         preview=not args.no_preview,
         save_frames=not args.no_save_frames,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,7 @@ from .. import db
 
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-CONFIG = load_config()
+CONFIG = load_config(os.environ.get("PRESENCE_CONFIG"))
 TZ = CONFIG.timezone
 
 
@@ -149,6 +150,49 @@ class EnrollStartRequest(BaseModel):
     employee_no: str | None = None
     dept: str | None = None
     count: int = 10
+
+
+@router.get("/api/cameras")
+def list_cameras() -> dict[str, Any]:
+    """Daftar kamera aktif + URL pratinjau tiap kanal."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.camera_key, c.name, c.source,
+                       COUNT(d.id) FILTER (WHERE d.active) AS desk_count
+                FROM cameras c
+                LEFT JOIN desks d ON d.camera_id = c.id
+                GROUP BY c.id
+                ORDER BY c.id
+                """
+            )
+            rows = list(cur.fetchall())
+    host = CONFIG.server.stream_host
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    by_key = {channel.id: channel for channel in CONFIG.channels}
+    for row in rows:
+        channel = by_key.get(row["camera_key"])
+        if channel is None:
+            # Kamera tidak ada di config aktif (mis. sisa config lama).
+            # Jangan beri URL stream: akan bentrok dengan kanal yang lain.
+            row["stream_url"] = None
+            row["in_active_config"] = False
+        else:
+            row["stream_url"] = f"http://{host}:{channel.stream_port}/stream"
+            row["in_active_config"] = True
+        row["source_label"] = _mask(row["source"])
+    return {"cameras": rows}
+
+
+def _mask(value: Any) -> str:
+    text = str(value or "")
+    if "@" in text and "//" in text:
+        scheme, rest = text.split("//", 1)
+        credentials, host = rest.split("@", 1)
+        return f"{scheme}//{credentials.split(':')[0]}:***@{host}"
+    return text
 
 
 @router.get("/api/enroll/status")

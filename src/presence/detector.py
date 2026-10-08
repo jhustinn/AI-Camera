@@ -27,6 +27,8 @@ class Detection:
     track_id: int
     bbox: tuple[int, int, int, int]
     conf: float
+    keypoints: np.ndarray | None = None
+    keypoints_conf: float = 0.0
 
     @property
     def center(self) -> tuple[float, float]:
@@ -73,6 +75,7 @@ class PersonDetector:
         root = project_root or Path(__file__).resolve().parents[2]
         model_path = self._prepare_model(root)
         self._model = YOLO(str(model_path))
+        self._has_keypoints = bool(getattr(self._model, "task", "") == "pose")
         tracker_cfg = root / "data" / f"tracker_{cfg.tracker}.yaml"
         tracker_cfg.parent.mkdir(parents=True, exist_ok=True)
         tracker_cfg.write_text(TRACKER_TEMPLATE.format(track_buffer=cfg.track_buffer), encoding="utf-8")
@@ -81,6 +84,8 @@ class PersonDetector:
 
     def _prepare_model(self, root: Path) -> Path:
         name = self._cfg.model
+        if self._cfg.unified and not name.endswith("-pose.pt"):
+            name = "yolov8n-pose.pt"
         if not name.endswith(".onnx"):
             return Path(name)
         onnx_path = Path(name)
@@ -96,6 +101,10 @@ class PersonDetector:
     @property
     def device(self) -> str:
         return self._device
+
+    @property
+    def has_keypoints(self) -> bool:
+        return self._has_keypoints
 
     def track(self, frame: np.ndarray) -> DetectionResult:
         if self._cfg.max_width and frame.shape[1] > self._cfg.max_width:
@@ -129,14 +138,25 @@ class PersonDetector:
             ids = boxes.id
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
+            keypoints = getattr(result, "keypoints", None)
             for index in range(len(xyxy)):
                 x1, y1, x2, y2 = [float(v) for v in xyxy[index]]
                 track_id = int(ids[index].item()) if ids is not None else -1
+                points = None
+                score = 0.0
+                if keypoints is not None and getattr(keypoints, "data", None) is not None:
+                    data = keypoints.data
+                    if index < len(data):
+                        points = data[index].cpu().numpy().astype(np.float32)
+                        if points.size:
+                            score = float(np.max(points[:, 2])) if points.shape[1] > 2 else 0.0
                 detections.append(
                     Detection(
                         track_id=track_id,
                         bbox=(int(x1), int(y1), int(x2), int(y2)),
                         conf=float(confs[index]),
+                        keypoints=points,
+                        keypoints_conf=score,
                     )
                 )
         fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0

@@ -17,6 +17,7 @@ detection:
   device: "0"
   tracker: bytetrack
   imgsz: 640
+  unified: true
   max_width: 0
   torch_threads: 4
   track_buffer: 30

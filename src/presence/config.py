@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,8 @@ class DetectionConfig:
     confidence: float = 0.45
     iou: float = 0.5
     device: str = "0"
-    imgsz: int = 480
+    imgsz: int = 640
+    unified: bool = False
     tracker: str = "bytetrack"
     track_buffer: int = 30
     max_width: int = 960
@@ -103,6 +105,22 @@ class PoseConfig:
 
 
 @dataclass
+class CameraChannel:
+    """Satu kamera CCTV dengan area kursi dan sumber videonya."""
+
+    id: str
+    name: str
+    source: Any
+    width: int = 1280
+    height: int = 720
+    fps: int = 25
+    fourcc: str = "MJPG"
+    backend: str = "dshow"
+    stream_port: int = 8001
+    desks: list[DeskConfig] = field(default_factory=list)
+
+
+@dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
@@ -132,6 +150,7 @@ class AppConfig:
     server: ServerConfig
     logging: LoggingConfig
     raw: dict[str, Any]
+    channels: list[CameraChannel] = field(default_factory=list)
 
     @property
     def desk_by_id(self) -> dict[int, DeskConfig]:
@@ -154,13 +173,101 @@ def _resolve_source(value: Any) -> Any:
     return text
 
 
+def _desk_list(items: Any, prefix: str = "") -> list[DeskConfig]:
+    desks: list[DeskConfig] = []
+    for index, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            continue
+        desks.append(
+            DeskConfig(
+                id=int(item.get("id", index + 1)),
+                label=str(item.get("label", f"Kursi {index + 1}")),
+                roi=tuple(float(v) for v in item.get("roi", [0, 0, 1, 1])),  # type: ignore[arg-type]
+                employee_id=item.get("employee_id"),
+            )
+        )
+    return desks
+
+
+def _build_channels(
+    raw: dict[str, Any],
+    camera_raw: dict[str, Any],
+    top_desks: list[DeskConfig],
+    server_raw: dict[str, Any],
+) -> list[CameraChannel]:
+    """Daftar kamera aktif.
+
+    Dua bentuk konfigurasi didukung:
+    1. `cameras:` berisi beberapa entri (multi kamera CCTV).
+    2. hanya `camera:` + `desks:` (satu kamera, bentuk lama).
+    """
+    entries = raw.get("cameras")
+    base_port = int(server_raw.get("stream_port", 8001))
+    if not entries:
+        return [
+            CameraChannel(
+                id=str(camera_raw.get("id", "cam-1")),
+                name=str(camera_raw.get("name", "Camera")),
+                source=_resolve_source(camera_raw.get("source", 0)),
+                width=int(camera_raw.get("width", 1280)),
+                height=int(camera_raw.get("height", 720)),
+                fps=int(camera_raw.get("fps", 25)),
+                fourcc=str(camera_raw.get("fourcc", "MJPG")),
+                backend=str(camera_raw.get("backend", "any")),
+                stream_port=base_port,
+                desks=top_desks,
+            )
+        ]
+
+    channels: list[CameraChannel] = []
+    for index, item in enumerate(entries):
+        if not isinstance(item, dict):
+            continue
+        merged_desks = _desk_list(item.get("desks"), f"cam{index + 1}") or top_desks
+        channels.append(
+            CameraChannel(
+                id=str(item.get("id", f"cam-{index + 1}")),
+                name=str(item.get("name", f"Kamera {index + 1}")),
+                source=_resolve_source(item.get("source", 0)),
+                width=int(item.get("width", 1280)),
+                height=int(item.get("height", 720)),
+                fps=int(item.get("fps", 25)),
+                fourcc=str(item.get("fourcc", "MJPG")),
+                backend=str(item.get("backend", "any")),
+                stream_port=int(item.get("stream_port", base_port + index)),
+                desks=merged_desks,
+            )
+        )
+    return channels
+
+
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env(text: str) -> str:
+    """Ganti ${VAR} dan ${VAR:-default} dengan nilai environment.
+
+    Dipakai agar kredensial RTSP tidak perlu ditulis di dalam file config yang
+    ikut ter-commit ke repository publik. Variabel yang tidak terisi akan
+    dibiarkan apa adanya supaya salah konfigurasi kelihatan saat runtime.
+    """
+    def repl(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        value = os.environ.get(name)
+        if value:
+            return value
+        return default if default is not None else match.group(0)
+
+    return _ENV_PATTERN.sub(repl, text)
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     config_path = Path(path or os.getenv("PRESENCE_CONFIG", "config.yaml"))
     if not config_path.is_absolute():
         candidate = PROJECT_ROOT / config_path
         config_path = candidate if candidate.exists() else Path(config_path)
     with open(config_path, "r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
+        raw = yaml.safe_load(_expand_env(handle.read())) or {}
 
     camera_raw = raw.get("camera", {})
     detection_raw = raw.get("detection", {})
@@ -170,15 +277,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     server_raw = raw.get("server", {})
     logging_raw = raw.get("logging", {})
 
-    desks = [
-        DeskConfig(
-            id=int(item["id"]),
-            label=str(item.get("label", f"Kursi {item['id']}")),
-            roi=tuple(float(v) for v in item.get("roi", [0, 0, 1, 1])),  # type: ignore[arg-type]
-            employee_id=item.get("employee_id"),
-        )
-        for item in raw.get("desks", [])
-    ]
+    desks = _desk_list(raw.get("desks"))
 
     det_size = face_raw.get("det_size", [320, 320])
     return AppConfig(
@@ -199,6 +298,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             iou=float(detection_raw.get("iou", 0.5)),
             device=str(detection_raw.get("device", "0")),
             imgsz=int(detection_raw.get("imgsz", 480)),
+            unified=bool(detection_raw.get("unified", False)),
             tracker=str(detection_raw.get("tracker", "bytetrack")),
             track_buffer=int(detection_raw.get("track_buffer", 30)),
             max_width=int(detection_raw.get("max_width", 960)),
@@ -253,8 +353,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             min_score=float(pose_raw.get("min_score", 0.5)),
             limb_ratio_min=float(pose_raw.get("limb_ratio_min", 0.3)),
             limb_ratio_max=float(pose_raw.get("limb_ratio_max", 1.8)),
-            sitting_knee_ratio=float(pose_raw.get("sitting_knee_ratio", 0.6)),
-            standing_knee_ratio=float(pose_raw.get("standing_knee_ratio", 0.95)),
+            sitting_knee_ratio=float(pose_raw.get("sitting_knee_ratio", 0.45)),
+            standing_knee_ratio=float(pose_raw.get("standing_knee_ratio", 0.6)),
         ),
         server=ServerConfig(
             host=str(server_raw.get("host", "127.0.0.1")),
@@ -270,5 +370,6 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             csv_fallback=bool(logging_raw.get("csv_fallback", True)),
             screenshot_dir=str(logging_raw.get("screenshot_dir", "data/screenshots")),
         ),
+        channels=_build_channels(raw, camera_raw, desks, server_raw),
         raw=raw,
     )

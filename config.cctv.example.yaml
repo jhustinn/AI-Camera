@@ -1,0 +1,139 @@
+# Template CCTV 4 kanal - SALIN ke config.cctv.yaml lalu sesuaikan.
+#
+#   Copy-Item config.cctv.example.yaml config.cctv.yaml
+#
+# Kredensial dibaca dari environment, JANGAN ditulis langsung di file ini
+# karena repository ini publik. Buat file .env (sudah masuk .gitignore):
+#
+#   CCTV_USER=admin
+#   CCTV_PASSWORD=kata-sandi-kamera
+#
+# Format URL Dahua:
+#   rtsp://USER:PASS@IP:554/cam/realmonitor?channel=1&subtype=1
+#     channel = 1 untuk kamera tunggal (bukan nomor kanal NVR)
+#     subtype = 0 main stream (1920x1080), 1 sub stream (704x576, default)
+#
+# Catatan: pakai subtype=1 untuk 4 kamera sekaligus. Main stream 4x 1080p
+# membebani GTX 1650 4GB. Naikkan ke subtype=0 hanya untuk 1-2 kamera
+# bila butuh kualitas tinggi (mis. untuk enroll wajah).
+
+timezone: Asia/Jakarta
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  poll_seconds: 2
+  stream_host: 0.0.0.0
+  stream_port: 8001
+  stream_fps: 10
+  jpeg_quality: 75
+
+detection:
+  model: yolov8n-pose.pt
+  unified: true
+  confidence: 0.4
+  iou: 0.5
+  device: "0"
+  imgsz: 640
+  tracker: bytetrack
+  track_buffer: 30
+  max_width: 1280
+  torch_threads: 4
+  classes: [0]
+
+face:
+  enabled: false
+  similarity_threshold: 0.45
+  min_margin: 0.06
+  run_every_n_frames: 8
+  region_ratio: 0.85
+  region_top_offset: 0.2
+  widen: 0.12
+  crop_max_width: 640
+  upscale: 2.0
+  score_threshold: 0.6
+  min_face_px: 24
+  votes_required: 4
+
+presence:
+  enter_confirm_sec: 8
+  leave_confirm_sec: 6
+  away_grace_sec: 90
+  min_session_sec: 300
+  desk_overlap_ratio: 0.4
+  desk_switch_grace_sec: 10
+
+pose:
+  enabled: true
+  model: yolov8n-pose.pt
+  imgsz: 640
+  confidence: 0.3
+  keypoint_confidence: 0.5
+  device: "0"
+  every_n_frames: 2
+  line_thickness: 2
+  radius: 3
+  posture_labels: true
+  min_keypoints: 8
+  bbox_margin: 0.05
+  smoothing: 0.25
+  hold_frames: 10
+  validate_limbs: true
+  legs: true
+  draw_min_keypoints: 5
+  min_inbox_ratio: 0.6
+  min_score: 0.5
+  limb_ratio_min: 0.3
+  limb_ratio_max: 1.8
+  sitting_knee_ratio: 0.45
+  standing_knee_ratio: 0.6
+
+logging:
+  level: INFO
+  csv_fallback: true
+  screenshot_dir: data/screenshots
+
+cameras:
+  - id: cctv-1
+    name: D1 - meja depan
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1
+    width: 704
+    height: 576
+    fps: 10
+    backend: ffmpeg
+    stream_port: 8001
+    desks:
+      - {id: 1, label: Meja 1, roi: [0.05, 0.35, 0.30, 0.95]}
+      - {id: 2, label: Meja 2, roi: [0.32, 0.35, 0.57, 0.95]}
+
+  - id: cctv-2
+    name: D2 - pojok
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.109:554/cam/realmonitor?channel=1&subtype=1
+    width: 704
+    height: 576
+    fps: 10
+    backend: ffmpeg
+    stream_port: 8002
+    desks:
+      - {id: 1, label: Meja 1, roi: [0.10, 0.35, 0.40, 0.95]}
+
+  - id: cctv-3
+    name: D3 - koridor
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.110:554/cam/realmonitor?channel=1&subtype=1
+    width: 704
+    height: 576
+    fps: 10
+    backend: ffmpeg
+    stream_port: 8003
+    desks: []
+
+  - id: cctv-4
+    name: D4 - meja belakang
+    source: rtsp://${CCTV_USER:-admin}:${CCTV_PASSWORD}@192.168.1.111:554/cam/realmonitor?channel=1&subtype=1
+    width: 704
+    height: 576
+    fps: 10
+    backend: ffmpeg
+    stream_port: 8004
+    desks:
+      - {id: 1, label: Meja 1, roi: [0.55, 0.30, 0.85, 0.95]}

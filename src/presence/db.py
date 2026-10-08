@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -18,10 +19,48 @@ DATABASE_URL = os.getenv(
 )
 
 
+_local = threading.local()
+
+
+def _connect() -> psycopg.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        if conn.closed:
+            conn = None
+        else:
+            return conn
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    _local.conn = conn
+    return conn
+
+
+def close_connections() -> None:
+    conn = getattr(_local, "conn", None)
+    if conn is not None and not conn.closed:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _local.conn = None
+
+
 @contextmanager
 def get_conn() -> Iterator[psycopg.Connection]:
-    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+    conn = _connect()
+    try:
         yield conn
+        if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            close_connections()
+        raise
+
+
+def get_conn_fresh() -> psycopg.Connection:
+    return _connect()
 
 
 def encode_embedding(embedding: np.ndarray) -> bytes:
@@ -332,31 +371,35 @@ def record_event(
 
 
 def upsert_live_status(payload: dict[str, Any]) -> None:
+    upsert_live_status_many([payload])
+
+
+def upsert_live_status_many(rows: Sequence[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    sql = """
+        INSERT INTO live_status
+            (desk_id, label, status, employee_id, employee_name, track_id,
+             sit_since, duration_sec, away_sec, session_id, fps, updated_at)
+        VALUES (%(desk_id)s, %(label)s, %(status)s, %(employee_id)s, %(employee_name)s,
+                %(track_id)s, %(sit_since)s, %(duration_sec)s, %(away_sec)s,
+                %(session_id)s, %(fps)s, now())
+        ON CONFLICT (desk_id) DO UPDATE SET
+            label = EXCLUDED.label,
+            status = EXCLUDED.status,
+            employee_id = EXCLUDED.employee_id,
+            employee_name = EXCLUDED.employee_name,
+            track_id = EXCLUDED.track_id,
+            sit_since = EXCLUDED.sit_since,
+            duration_sec = EXCLUDED.duration_sec,
+            away_sec = EXCLUDED.away_sec,
+            session_id = EXCLUDED.session_id,
+            fps = EXCLUDED.fps,
+            updated_at = now()
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO live_status
-                    (desk_id, label, status, employee_id, employee_name, track_id,
-                     sit_since, duration_sec, away_sec, session_id, fps, updated_at)
-                VALUES (%(desk_id)s, %(label)s, %(status)s, %(employee_id)s, %(employee_name)s,
-                        %(track_id)s, %(sit_since)s, %(duration_sec)s, %(away_sec)s,
-                        %(session_id)s, %(fps)s, now())
-                ON CONFLICT (desk_id) DO UPDATE SET
-                    label = EXCLUDED.label,
-                    status = EXCLUDED.status,
-                    employee_id = EXCLUDED.employee_id,
-                    employee_name = EXCLUDED.employee_name,
-                    track_id = EXCLUDED.track_id,
-                    sit_since = EXCLUDED.sit_since,
-                    duration_sec = EXCLUDED.duration_sec,
-                    away_sec = EXCLUDED.away_sec,
-                    session_id = EXCLUDED.session_id,
-                    fps = EXCLUDED.fps,
-                    updated_at = now()
-                """,
-                payload,
-            )
+            cur.executemany(sql, list(rows))
         conn.commit()
 
 
